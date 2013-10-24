@@ -1,71 +1,94 @@
 package me.ssmoot.cloudant
 
 import sbt.Plugin
-import scala.io.Source.fromFile
+import scala.io.Source.fromInputStream
 import dispatch._
 import dispatch.Defaults._
-import com.ning.http.client.Response
+import spray.json._
+import spray.json.DefaultJsonProtocol._
+import com.ning.http.client
+import scala.concurrent.Await
+import scala.concurrent.duration._
+import scala.annotation.tailrec
+import scala.util.{Failure, Try, Success}
 
-object CloudantPlugin extends Plugin {
+object CloudantPlugin extends App {
 
-//  //read config data from a file with 3 lines: user name, password, and database name
-//  val List(user,pass,db) = fromFile("config").getLines.toList
-//  //base request builder for all requests containing user name and database name
-//  def baseRb = host(s"${user}.cloudant.com").secure.as_!(user, pass) / db
-//  //function to parse the response
-//  val parseResponse = (resp:Response) => resp.getStatusCode -> parse(resp.getResponseBody).asInstanceOf[JObject]
-//
-//  def create(doc:JObject) = {
-//    val rb = baseRb
-//      .POST //use POST to create documents
-//      .setBody(compact(render(doc))) //set the json document as the request body
-//      .setHeader("Content-Type", "application/json") > //set the content type http header
-//      parseResponse //add a function that processes the response
-//    Http(rb).apply  //execute the request
-//  }
-//
-//  def read(id:String) = {
-//    val rb = (baseRb / id) > parseResponse
-//    Http(rb).apply
-//  }
-//
-//  def update(id:String, doc:JObject) = {
-//    val rb = (baseRb / id)
-//      .PUT
-//      .setBody(compact(render(doc)))
-//      .setHeader("Content-Type", "application/json") >
-//      parseResponse
-//	  Http(rb).apply
-//  }
-//
-//  def delete(id:String, rev:String) = {
-//    val rb = (baseRb / id)
-//      .DELETE
-//      .addQueryParameter("rev", rev) >
-//      parseResponse
-//	  Http(rb).apply
-//  }
-//
-//  def printResponse(resp:(Int, JObject)) {
-//    val (status, body) = resp
-//    println(s"Status code: ${status}")
-//    println(compact(render(body)))
-//  }
-//
-//  def getStr(field:String, o:JObject) = {
-//    val JString(rev) = o \\ field
-//    rev
-//  }
-//
-//  val creationResponse = create(("name" -> "john") ~ ("age" -> 35))
-//  printResponse(creationResponse)
-//  val id = getStr("id", creationResponse._2)
-//  val readResponse = read(id)
-//  printResponse(readResponse)
-//  val rev1 = getStr("_rev", readResponse._2)
-//  val updateResponse = update(id, ("name" -> "john") ~ ("age" -> 36) ~ ("_rev" -> rev1))
-//  printResponse(updateResponse)
-//  val rev2 = getStr("rev", updateResponse._2)
-//  printResponse(delete(id, rev2))
-  
+  object as {
+    object String extends (client.Response => String) {
+      def apply(r: client.Response) = r.getResponseBody
+    }
+
+    object JsObject extends (client.Response => JsObject) {
+      def apply(r: client.Response) = r.getResponseBody.asJson.asJsObject
+    }
+
+    object seqOf_JsObject extends (client.Response => Seq[JsObject]) {
+      def apply(r: client.Response) = r.getResponseBody.asJson.convertTo[Seq[JsObject]]
+    }
+  }
+  // read config data from a file with 4 lines: hostname, user name, password, and database name
+  val List(hostname, user,pass,db) = fromInputStream(getClass.getResourceAsStream("/config")).getLines.toList
+
+  // base request builder for all requests containing user name and database name
+  def baseRequest = host(hostname).secure.as_!(user, pass) / db
+
+  def allDocs(startKey: Option[String], limit: Int): Future[Seq[(String,String)]] = {
+
+    val queryString = Map("limit" -> Some(limit), "startKey" -> startKey) collect {
+      case (key, Some(value)) => key -> value.toString
+    }
+
+    val allDocsRequest = baseRequest / "_all_docs" <<? queryString
+
+    Http(allDocsRequest OK as.JsObject) map { response =>
+      response.fields("rows").convertTo[Seq[JsObject]].map { row =>
+        row.getFields("key", "value") match {
+          case Seq(key, value) => {
+              key.convertTo[String] ->
+              value.asJsObject.fields("rev").convertTo[String]
+          }
+        }
+      }
+    }
+  }
+
+  def bulkDelete(docs: Seq[(String,String)]): Future[Seq[JsObject]] = {
+
+    val json = JsObject(
+      "docs" -> JsArray(
+        docs.map {
+          case (id, rev) => JsObject(
+            "_id" -> JsString(id),
+            "_rev" -> JsString(rev),
+            "_deleted" -> JsBoolean(true))
+        }:_*
+      )
+    )
+
+    val request = baseRequest.POST / "_bulk_docs" <:< Map("Content-Type" -> "application/json") << json.compactPrint
+
+    Http(request OK as.seqOf_JsObject)
+  }
+
+  def truncate:Int = {
+
+    @tailrec
+    def truncate(limit: Int, acc: Int): Int = {
+      println(s"$acc DELETED...")
+
+      val revisions = Await.result(allDocs(None, limit), 30 seconds)
+
+      if(revisions.isEmpty) {
+        acc
+      } else {
+        val docs = Await.result(bulkDelete(revisions), 30 seconds)
+        truncate(limit, acc + docs.size)
+      }
+    }
+
+    truncate(1000, 0)
+  }
+
+  println(s"TOTAL ROWS DELETED: ${truncate}")
 }
